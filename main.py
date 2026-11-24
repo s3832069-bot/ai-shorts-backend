@@ -15,96 +15,143 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-os.makedirs("outputs", exist_ok=True)
-app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+os.makedirs("downloads", exist_ok=True)
+app.mount("/downloads", StaticFiles(directory="downloads"), name="downloads")
 
-FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-
-@app.get("/")
-def home():
-    return {"status": "AI Shorts Maker Backend is Running!"}
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 @app.post("/generate")
 async def generate_shorts(youtube_url: str = Form(...)):
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY missing on server")
-
     job_id = str(uuid.uuid4())[:8]
-    video_path = f"/tmp/{job_id}.mp4"
-
+    output_dir = os.path.join("downloads", job_id)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    video_path = os.path.join(output_dir, "input.mp4")
+    
+    # YouTube bot-detection bypass options
+    ydl_opts = {
+        'format': 'best[ext=mp4]/best',
+        'outtmpl': video_path,
+        'socket_timeout': 30,
+        'extractor-args': 'youtube:player_client=android',
+        'geo_bypass': True,
+        'nocheckcertificate': True
+    }
+    
     try:
-        # 1. YouTube से वीडियो डाउनलोड करें (तेज़ और हल्की क्वालिटी में ताकि फ्री सर्वर पर क्रैश न हो)
-        ydl_opts = {
-            "format": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
-            "outtmpl": video_path,
-            "quiet": True,
-            "no_warnings": True,
-        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(youtube_url, download=True)
-            title = info.get("title", "Video")
-
-        # 2. Gemini AI को वीडियो भेजकर बेस्ट शॉर्ट्स के टाइमस्टैम्प निकालें
-        client = genai.Client(api_key=api_key)
-        uploaded_file = client.files.upload(file=video_path)
-
-        prompt = (
-            "Watch and listen to this video carefully. Identify the 3 most engaging, viral, "
-            "or impactful moments suitable for YouTube Shorts or Instagram Reels (each 15 to 45 seconds long). "
-            "Return ONLY a valid JSON array of objects with keys: 'title', 'start' (in seconds, integer), and 'end' (in seconds, integer). "
-            "Example: [{\"title\": \"Best Hook\", \"start\": 12, \"end\": 40}]"
-        )
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[uploaded_file, prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
-
-        clips_data = json.loads(response.text)
-        generated_clips = []
-
-        # 3. FFmpeg से हर क्लिप को काटकर 9:16 (Vertical Shorts) में बदलें
-        for idx, clip in enumerate(clips_data[:3]):
-            start = int(clip["start"])
-            end = int(clip["end"])
-            duration = max(5, min(60, end - start))
-            out_name = f"{job_id}_short_{idx+1}.mp4"
-            out_path = os.path.join("outputs", out_name)
-
-            cmd = [
-                FFMPEG_PATH, "-y",
-                "-ss", str(start),
-                "-i", video_path,
-                "-t", str(duration),
-                "-vf", "crop=ih*9/16:ih,scale=720:1280",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-                "-c:a", "aac", "-b:a", "128k",
-                out_path
-            ]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            generated_clips.append({
-                "title": clip.get("title", f"Short Clip {idx+1}"),
-                "start": start,
-                "end": start + duration,
-                "url": f"/outputs/{out_name}"
-            })
-
-        # टेम्पररी फाइल साफ करें
-        if os.path.exists(video_path):
-            os.remove(video_path)
-
-        return {"video_title": title, "clips": generated_clips}
-
+            video_title = info.get('title', 'YouTube Video')
     except Exception as e:
-        if os.path.exists(video_path):
-            os.remove(video_path)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"YouTube Download Error: {str(e)}")
+    
+    # Fallback if extension varies
+    actual_video_path = video_path
+    if not os.path.exists(actual_video_path):
+        for f in os.listdir(output_dir):
+            if f.startswith("input"):
+                actual_video_path = os.path.join(output_dir, f)
+                break
+                
+    if not os.path.exists(actual_video_path):
+        raise HTTPException(status_code=500, detail="Downloaded video file not found.")
+
+    # Get video duration using ffmpeg
+    try:
+        probe_cmd = [
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            "-i", actual_video_path
+        ]
+        result = subprocess.run(probe_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        duration = 60.0 # default fallback
+        for line in result.stderr.split("\n"):
+            if "Duration:" in line:
+                parts = line.split("Duration:")[1].split(",")[0].strip().split(":")
+                duration = float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+    except Exception:
+        duration = 60.0
+
+    # Ask Gemini to find viral highlights
+    prompt = f"""
+    Analyze this YouTube video titled "{video_title}" with total duration {duration} seconds.
+    Identify 3 most engaging, viral-worthy segments suitable for Shorts/Reels (each 15 to 45 seconds long).
+    Provide the start time and end time in seconds, and a catchy title for each clip.
+    Return ONLY valid JSON in this exact structure without any markdown formatting or extra text:
+    [
+      {{"start": 10, "end": 40, "title": "Catchy Title 1"}},
+      {{"start": 60, "end": 95, "title": "Catchy Title 2"}},
+      {{"start": 120, "end": 155, "title": "Catchy Title 3"}}
+    ]
+    """
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        text_response = response.text.strip()
+        if text_response.startswith("```json"):
+            text_response = text_response[7:-3].strip()
+        elif text_response.startswith("```"):
+            text_response = text_response[3:-3].strip()
+            
+        clips_data = json.loads(text_response)
+    except Exception:
+        # Fallback default timestamps if AI fails
+        clip_len = min(30, int(duration / 4))
+        clips_data = [
+            {"start": clip_len, "end": clip_len * 2, "title": "Highlight 1"},
+            {"start": clip_len * 2, "end": clip_len * 3, "title": "Highlight 2"},
+            {"start": clip_len * 3, "end": min(int(duration), clip_len * 4), "title": "Highlight 3"}
+        ]
+
+    processed_clips = []
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+
+    for i, clip in enumerate(clips_data):
+        start = float(clip["start"])
+        end = float(clip["end"])
+        duration_clip = max(5, end - start)
+        output_clip_filename = f"short_{i+1}.mp4"
+        output_clip_path = os.path.join(output_dir, output_clip_filename)
+
+        # FFmpeg filter to crop center 9:16 for vertical reels
+        vf_filter = "crop=ih*(9/16):ih,scale=1080:1920"
+
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-ss", str(start),
+            "-i", actual_video_path,
+            "-t", str(duration_clip),
+            "-vf", vf_filter,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-c:a", "aac",
+            output_clip_path
+        ]
+
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            processed_clips.endswith() # dummy
+            processed_clips.append({
+                "title": clip["title"],
+                "start": int(start),
+                "end": int(end),
+                "url": f"/downloads/{job_id}/{output_clip_filename}"
+            })
+        except Exception:
+            continue
+
+    if not processed_clips:
+        raise HTTPException(status_code=500, detail="Failed to crop video clips.")
+
+    return {
+        "video_title": video_title,
+        "clips": processed_clips
+}
